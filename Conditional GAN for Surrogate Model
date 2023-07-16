@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import TensorDataset
+import torchvision.transforms as transforms
+from torchvision.utils import save_image
+import torch.autograd as autograd
+import torch.nn.functional as F
+import os
+from PIL import Image
+import PIL
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torchvision.transforms.functional as TF
+from torchvision.transforms import GaussianBlur
+from torchvision import transforms
+from torchvision.transforms import RandomCrop, RandomHorizontalFlip, ToTensor, Normalize
+
+from google.colab import drive
+drive.mount('/content/drive')
+os.makedirs('drive/MyDrive/Colab Notebooks/DLBasics2023_colab/Last_problem/', exist_ok=True)
+
+# データのパス
+input_data_path = '/content/drive/MyDrive/Colab Notebooks/DLBasics2023_colab/Last_problem/data/parameters.csv'
+image_folder_path = '/content/drive/MyDrive/Colab Notebooks/DLBasics2023_colab/Last_problem/data/pictures/'
+
+# データの読み込み
+input_data = pd.read_csv(input_data_path)
+
+# 入力パラメータの準備
+radius_A = input_data['radius_A'].values
+radius_B = input_data['radius_B'].values
+radius_C = input_data['radius_C'].values
+pressure = input_data['pressure'].values
+
+# 出力パラメータの準備
+#max_velocity = output_data['max_velocity'].values
+
+# 入力パラメータの正規化
+mean_A = np.mean(radius_A)
+std_A = np.std(radius_A)
+radius_A = (radius_A - mean_A) / std_A
+
+mean_B = np.mean(radius_B)
+std_B = np.std(radius_B)
+radius_B = (radius_B - mean_B) / std_B
+
+mean_C = np.mean(radius_C)
+std_C = np.std(radius_C)
+radius_C = (radius_C - mean_C) / std_C
+
+mean_p = np.mean(pressure)
+std_p = np.std(pressure)
+pressure = (pressure - mean_p) / std_p
+
+
+# 画像データの読み込み
+transform = transforms.Compose([
+    transforms.Resize((1280, 720)),
+    transforms.ToTensor()
+])
+
+pictures = []
+file_list = sorted(os.listdir(image_folder_path))  # ファイル名のリストをソートする
+
+for filename in file_list:
+    if filename.endswith('.png'):
+        file_path = os.path.join(image_folder_path, filename)
+        image = Image.open(file_path)
+        image = transform(image)
+        pictures.append(image)
+
+# データセットの定義
+class CustomDataset(Dataset):
+    def __init__(self, radius_A, radius_B, radius_C, pressure, pictures, transform=None):
+        self.radius_A = radius_A
+        self.radius_B = radius_B
+        self.radius_C = radius_C
+        self.pressure = pressure
+        self.pictures = pictures
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.radius_A)
+
+    def __getitem__(self, index):
+        r_A = self.radius_A[index]
+        r_B = self.radius_B[index]
+        r_C = self.radius_C[index]
+        p = self.pressure[index]
+        pic = self.pictures[index]
+
+        if isinstance(pic, PIL.Image.Image):
+            if self.transform is not None:
+                pic = self.transform(pic)
+        elif isinstance(pic, torch.Tensor):
+            # 既にテンソルになっている場合は何もしない
+            pass
+        else:
+            raise TypeError("pic should be PIL Image or torch.Tensor.")
+
+        return (r_A, r_B, r_C, p), pic
+
+
+
+
+class Generator(nn.Module):
+    def __init__(self):
+        super(Generator, self).__init__()
+        self.fc = nn.Linear(4, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 3 * 720 * 1280)
+        self.leakyrelu = nn.LeakyReLU(0.2)
+        self.batchnorm1 = nn.BatchNorm1d(256)
+        self.batchnorm2 = nn.BatchNorm1d(128)
+
+    def forward(self, x):
+        x = self.leakyrelu(self.batchnorm1(self.fc(x)))
+        x = self.leakyrelu(self.batchnorm2(self.fc2(x)))
+        x = torch.tanh(self.fc3(x))
+        x = x.view(x.size(0), 3, 720, 1280)
+        return x
+
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1)
+        self.fc = nn.Linear(128 * 180 * 320, 1)
+        self.leakyrelu = nn.LeakyReLU(0.2)
+        self.batchnorm1 = nn.BatchNorm2d(64)
+        self.batchnorm2 = nn.BatchNorm2d(128)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.leakyrelu(self.batchnorm1(self.conv1(x)))
+        x = self.leakyrelu(self.batchnorm2(self.conv2(x)))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        x = self.sigmoid(x)
+        return x.view(-1, 1, 1, 1)
+
+# データ拡張を定義
+data_transform = transforms.Compose([
+    transforms.RandomCrop(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
+
+# ハイパーパラメータの設定
+batch_size = 32
+num_epochs = 300
+lr = 0.0002
+beta1 = 0.5
+beta2 = 0.999
+accumulation_steps = 4  # Gradient Accumulationのステップ数
+lambda_gp = 10.0  # 勾配ペナルティの重み係数
+log_interval = 10  # ログを表示する間隔
+
+# デバイスの設定
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# データセットの作成
+#dataset = CustomDataset(radius_A, radius_B, radius_C, pressure, pictures)
+dataset = CustomDataset(radius_A, radius_B, radius_C, pressure, pictures, transform=data_transform)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# GeneratorとDiscriminatorのインスタンスを作成し、デバイスに配置する
+generator = Generator().to(device)
+discriminator = Discriminator().to(device)
+
+# 損失関数と最適化手法の定義
+criterion = nn.MSELoss()  # 生成器の損失関数を平均二乗誤差に変更
+#optimizer_D = optim.RMSprop(discriminator.parameters(), lr=lr)
+#optimizer_G = optim.RMSprop(generator.parameters(), lr=lr)
+optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(beta1, beta2))
+optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(beta1, beta2))
+
+# ラベルの定義
+real_labels = torch.ones(batch_size, 1, device=device)
+fake_labels = torch.zeros(batch_size, 1, device=device)
+
+torch.cuda.empty_cache()
+torch.backends.cudnn.benchmark = True
+
+# ミニバッチのループ
+for epoch in range(num_epochs):
+    generator.train()  # 生成器を訓練モードに設定
+    discriminator.train()  # 識別器を訓練モードに設定
+
+    # 各エポックの損失関数と生成した画像を保存するリストを作成
+    epoch_losses_G = []
+    epoch_losses_D = []
+    generated_images = []
+
+    for i, (params, real_images) in enumerate(dataloader):
+        r_A, r_B, r_C, p = params
+        r_A = r_A.to(device)
+        r_B = r_B.to(device)
+        r_C = r_C.to(device)
+        p = p.to(device)
+        real_images = real_images.to(device)
+
+        # 以下、各処理の実行
+        optimizer_G.zero_grad()
+        optimizer_D.zero_grad()
+
+        for step in range(accumulation_steps):
+            fake_inputs = torch.cat((r_A.unsqueeze(1), r_B.unsqueeze(1), r_C.unsqueeze(1), p.unsqueeze(1)), dim=1).float()
+            fake_images = generator(fake_inputs)
+
+            fake_outputs = discriminator(fake_images)
+            loss_G = -torch.mean(fake_outputs)
+            loss_G.backward()
+
+            real_outputs = discriminator(real_images)
+            fake_outputs = discriminator(fake_images.detach())
+            loss_D = -(torch.mean(real_outputs) - torch.mean(fake_outputs))
+            loss_D.backward()
+
+        optimizer_G.step()
+        optimizer_D.step()
+
+        # 識別器の重みクリッピング
+        for param in discriminator.parameters():
+            param.data.clamp_(-0.01, 0.01)
+
+        # エポックの損失関数を記録
+        epoch_losses_G.append(loss_G.item())
+        epoch_losses_D.append(loss_D.item())
+
+        # 生成した画像を記録
+        with torch.no_grad():
+            generated_images.append(fake_images.detach())
+
+        # 進捗表示
+        print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], "
+              f"Generator Loss: {loss_G.item():.4f}, Discriminator Loss: {loss_D.item():.4f}")
+
+    # エポックごとの損失関数と生成した画像を表示
+    avg_loss_G = sum(epoch_losses_G) / len(epoch_losses_G)
+    avg_loss_D = sum(epoch_losses_D) / len(epoch_losses_D)
+    print(f"Epoch [{epoch+1}/{num_epochs}], Average Generator Loss: {avg_loss_G:.4f}, "
+          f"Average Discriminator Loss: {avg_loss_D:.4f}")
+
+
+# 入力パラメータの準備
+radius_A_t = 14
+radius_B_t = 15
+radius_C_t = 20
+pressure_t = 86000
+
+# 入力パラメータの正規化
+radius_A_t = (radius_A_t - mean_A) / std_A
+radius_B_t = (radius_B_t - mean_B) / std_B
+radius_C_t = (radius_C_t - mean_C) / std_C
+pressure_t = (pressure_t - mean_p) / std_p
+
+
+# 入力パラメータの結合
+input_params = torch.tensor([[radius_A_t, radius_B_t, radius_C_t, pressure_t]] * 32, dtype=torch.float32).to(device)
+
+# Generatorに入力して画像を生成
+output_image = generator(input_params)
+image = output_image[0]
+
+# TensorをPIL画像に変換
+image_pil = TF.to_pil_image(image)
+
+# 画像を表示
+image_pil.show()
